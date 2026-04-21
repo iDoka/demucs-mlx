@@ -10,9 +10,107 @@ Usage:
 import argparse
 import concurrent.futures
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
+
+
+_MAGIC_EXTENSIONS = {
+    b"RIFF": ".wav",
+    b"fLaC": ".flac",
+    b"OggS": ".ogg",
+    b"ID3": ".mp3",
+}
+
+
+def _sniff_extension(path):
+    # Return a likely-correct extension based on file magic bytes, or None
+    # if the existing extension already matches what we see. Useful when a
+    # file is misnamed (e.g. an MP4/AAC file with an .mp3 extension), since
+    # CoreAudio dispatches by extension.
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return None
+    if len(head) >= 8 and head[4:8] == b"ftyp":
+        return ".m4a"
+    for magic, ext in _MAGIC_EXTENSIONS.items():
+        if head.startswith(magic):
+            return ext
+    return None
+
+
+def load_audio(path, dtype="float32"):
+    import soundfile as sf
+
+    soundfile_error = None
+    try:
+        wav, sr = sf.read(path, dtype=dtype)
+    except Exception as exc:
+        soundfile_error = exc
+        wav = sr = None
+
+    if wav is None and sys.platform == "darwin":
+        afconvert = shutil.which("afconvert")
+        if afconvert:
+            # CoreAudio uses the extension to pick a parser, so if the file
+            # is misnamed (e.g. an MP4 container with a .mp3 suffix) we copy
+            # it to a temp file with the sniffed extension first.
+            sniffed = _sniff_extension(path)
+            current_ext = os.path.splitext(path)[1].lower()
+            input_path = path
+            staged_input = None
+            if sniffed and sniffed != current_ext:
+                fd, staged_input = tempfile.mkstemp(suffix=sniffed)
+                os.close(fd)
+                shutil.copyfile(path, staged_input)
+                input_path = staged_input
+
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav",
+                                                 delete=False) as tmp:
+                    tmp_path = tmp.name
+                subprocess.run(
+                    [afconvert, "-f", "WAVE", "-d", "LEI16",
+                     input_path, tmp_path],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                wav, sr = sf.read(tmp_path, dtype=dtype)
+            except Exception:
+                pass
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                if staged_input and os.path.exists(staged_input):
+                    os.remove(staged_input)
+
+    if wav is None:
+        try:
+            import librosa
+
+            wav, sr = librosa.load(path, sr=None, mono=False, dtype=dtype)
+            if wav.ndim > 1:
+                wav = wav.T
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"Failed to decode audio file {path!r} with soundfile "
+                f"({soundfile_error}) and fallback decoder "
+                f"({fallback_error}). Try converting the file to WAV first."
+            ) from (soundfile_error or fallback_error)
+
+    if wav.ndim == 1:
+        wav = wav[:, None]
+    if wav.shape[1] == 1:
+        # HTDemucs expects stereo input; duplicate the mono channel.
+        wav = wav.repeat(2, axis=1)
+    return wav, sr
 
 
 def main():
@@ -52,7 +150,7 @@ def main():
     output_group.add_argument("--m4a", action="store_true",
                               help="save stems as M4A/AAC instead of WAV")
     output_group.add_argument("--float32", action="store_true",
-                              help="save as float32 WAV instead of int16")
+                              help="save as float32 WAV instead of int16 WAV")
 
     quality_group = parser.add_argument_group("quality")
     quality_group.add_argument("--shifts", type=int, default=1,
@@ -69,6 +167,9 @@ def main():
 
     args = parser.parse_args()
 
+    if args.mp3 and args.float32:
+        parser.error("--float32 is only supported for WAV output")
+
     import mlx.core as mx
     import numpy as np
     import soundfile as sf
@@ -77,21 +178,7 @@ def main():
 
     # Load audio
     print(f"Loading audio: {args.input}")
-    try:
-        wav, sr = sf.read(args.input, dtype='float32')
-    except Exception:
-        # Fallback: decode via ffmpeg for formats soundfile doesn't support (M4A, AAC, etc.)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", args.input, "-ar", "44100",
-                 "-ac", "2", "-f", "wav", tmp_path],
-                check=True, capture_output=True,
-            )
-            wav, sr = sf.read(tmp_path, dtype='float32')
-        finally:
-            os.unlink(tmp_path)
+    wav, sr = load_audio(args.input, dtype="float32")
     if wav.ndim == 1:
         wav = wav[:, None]
     # wav: [T, C] → [1, C, T]

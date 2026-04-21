@@ -42,6 +42,9 @@ class HTDemucs(nn.Module):
         growth: int = 2,
         # STFT
         nfft: int = 4096,
+        wiener_iters: int = 0,
+        end_iters: int = 0,
+        wiener_residual: bool = False,
         cac: bool = True,
         # Main structure
         depth: int = 4,
@@ -119,9 +122,20 @@ class HTDemucs(nn.Module):
         self.segment = segment
         self.use_train_segment = use_train_segment
         self.nfft = nfft
+        self.wiener_iters = wiener_iters
+        self.end_iters = end_iters
+        self.wiener_residual = wiener_residual
         self.hop_length = nfft // 4
         self.freq_emb = None
         self.freq_emb_scale = 0.
+
+        if (self.wiener_iters != 0 or self.end_iters != 0
+                or self.wiener_residual):
+            raise NotImplementedError(
+                "The MLX port does not implement Wiener filtering. "
+                "Only checkpoints with wiener_iters=0, end_iters=0, and "
+                "wiener_residual=False are supported."
+            )
 
         self.encoder = []
         self.decoder = []

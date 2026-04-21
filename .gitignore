@@ -18,6 +18,7 @@ venv/
 env/
 
 separated/
+input/
 *.wav
 *.mp3
 *.m4a
