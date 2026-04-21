@@ -69,7 +69,7 @@ The first run downloads the pretrained model (~80 MB, cached in `~/.cache/demucs
 $ demucs-mlx --help
 
 usage: demucs-mlx [-h] [-n NAME] [-o DIR] [--stems STEM [STEM ...]]
-                  [--mp3] [--float32] [--shifts N] [--overlap F]
+                  [--mp3] [--m4a] [--float32] [--shifts N] [--overlap F]
                   [--no-split] input
 
 Separate a song into stems (drums, bass, other, vocals)
@@ -85,6 +85,7 @@ output:
   -o, --output DIR      output directory (default: ./separated/<model>/<song>/)
   --stems STEM [STEM]   stems to save: drums bass other vocals (default: all)
   --mp3                 save as MP3 instead of WAV
+  --m4a                 save stems as M4A/AAC instead of WAV
   --float32             save as float32 WAV instead of int16
 
 quality:

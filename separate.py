@@ -8,7 +8,10 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import os
+import subprocess
+import tempfile
 import time
 
 
@@ -46,6 +49,8 @@ def main():
                                    "drums bass other vocals (default: all)")
     output_group.add_argument("--mp3", action="store_true",
                               help="save stems as MP3 instead of WAV")
+    output_group.add_argument("--m4a", action="store_true",
+                              help="save stems as M4A/AAC instead of WAV")
     output_group.add_argument("--float32", action="store_true",
                               help="save as float32 WAV instead of int16")
 
@@ -72,7 +77,21 @@ def main():
 
     # Load audio
     print(f"Loading audio: {args.input}")
-    wav, sr = sf.read(args.input, dtype='float32')
+    try:
+        wav, sr = sf.read(args.input, dtype='float32')
+    except Exception:
+        # Fallback: decode via ffmpeg for formats soundfile doesn't support (M4A, AAC, etc.)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", args.input, "-ar", "44100",
+                 "-ac", "2", "-f", "wav", tmp_path],
+                check=True, capture_output=True,
+            )
+            wav, sr = sf.read(tmp_path, dtype='float32')
+        finally:
+            os.unlink(tmp_path)
     if wav.ndim == 1:
         wav = wav[:, None]
     # wav: [T, C] → [1, C, T]
@@ -112,23 +131,61 @@ def main():
     print(f"\nSeparated in {sep_time:.1f}s "
           f"({wav.shape[2] / sr / sep_time:.2f}x realtime)")
 
-    # Save
+    # Convert to numpy and free MLX arrays + model from GPU memory before saving
     sources_np = np.array(sources[0])  # [S, C, T]
     stem_names = args.stems or model.sources
+    all_sources = model.sources
+    del mix, sources, model
+    mx.clear_cache()
     basename = os.path.splitext(os.path.basename(args.input))[0]
     out_dir = args.output or os.path.join("separated", args.name)
     out_dir = os.path.join(out_dir, basename)
     os.makedirs(out_dir, exist_ok=True)
 
-    for i, src_name in enumerate(model.sources):
-        if src_name not in stem_names:
-            continue
+    use_ffmpeg = args.mp3 or args.m4a
+    if use_ffmpeg:
+        ext = "mp3" if args.mp3 else "m4a"
+        ffmpeg_extra = ["-q:a", "2"] if args.mp3 else ["-c:a", "aac_at", "-q:a", "100"]
+    else:
+        ext = "wav"
+
+    subtype = 'FLOAT' if args.float32 else 'PCM_16'
+
+    # Collect stems to save
+    stems_to_save = [
+        (i, src_name)
+        for i, src_name in enumerate(all_sources)
+        if src_name in stem_names
+    ]
+
+    def encode_stem(i, src_name):
         stem = sources_np[i].T  # [T, C]
-        ext = "mp3" if args.mp3 else "wav"
         out_path = os.path.join(out_dir, f"{src_name}.{ext}")
-        subtype = 'FLOAT' if args.float32 else 'PCM_16'
-        sf.write(out_path, stem, sr, subtype=subtype)
-        print(f"Saved: {out_path}")
+        if use_ffmpeg:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                sf.write(tmp_path, stem, sr, subtype=subtype)
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", tmp_path] + ffmpeg_extra + [out_path],
+                    check=True, capture_output=True,
+                )
+            finally:
+                os.unlink(tmp_path)
+        else:
+            sf.write(out_path, stem, sr, subtype=subtype)
+        return out_path
+
+    if use_ffmpeg:
+        time.sleep(0.5)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(stems_to_save)) as executor:
+            futures = {executor.submit(encode_stem, i, src_name): src_name
+                       for i, src_name in stems_to_save}
+            for future in concurrent.futures.as_completed(futures):
+                print(f"Saved: {future.result()}")
+    else:
+        for i, src_name in stems_to_save:
+            print(f"Saved: {encode_stem(i, src_name)}")
 
     print(f"\nDone! Output in: {out_dir}")
 
