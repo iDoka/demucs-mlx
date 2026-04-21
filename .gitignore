@@ -1,3 +1,8 @@
+## tmp files
+*~
+.DS_Store
+
+
 __pycache__/
 *.pyc
 *.pyo
@@ -15,6 +20,8 @@ env/
 separated/
 *.wav
 *.mp3
+*.m4a
+*.mp4
 *.flac
 
 .cache/
