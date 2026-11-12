@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 SOURCES = ["drums", "bass", "other", "vocals"]
 ROOT_URL = "https://dl.fbaipublicfiles.com/demucs/"
-REMOTE_ROOT = Path(__file__).parent.parent / 'remote'
+REMOTE_ROOT = Path(__file__).parent / 'remote'
 
 
 # Meta's checkpoints are pickled with weights_only=False and reference classes

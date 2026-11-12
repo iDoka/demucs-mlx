@@ -23,7 +23,7 @@ dependencies = [
 resample = ["librosa"]
 
 [project.scripts]
-demucs-mlx = "separate:main"
+demucs-mlx = "demucs_mlx.cli:main"
 
 [project.urls]
 Repository = "https://github.com/andrade0/demucs-mlx"
@@ -32,4 +32,4 @@ Repository = "https://github.com/andrade0/demucs-mlx"
 include = ["demucs_mlx*"]
 
 [tool.setuptools.package-data]
-"*" = ["*.txt", "*.yaml"]
+demucs_mlx = ["remote/*.txt", "remote/*.yaml"]

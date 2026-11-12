@@ -48,7 +48,15 @@ cd demucs-mlx
 make install
 ```
 
-This installs all dependencies (MLX, PyTorch CPU, etc.) and puts the `demucs-mlx` command in your PATH (`~/.local/bin`).
+This installs the `demucs_mlx` package in editable mode with all dependencies (MLX, PyTorch CPU, etc.) and puts the `demucs-mlx` command in your PATH (`~/.local/bin`).
+
+Alternatively, install it as a regular Python package into your active environment:
+
+```bash
+pip install .            # or: pip install git+https://github.com/iDoka/demucs-mlx.git
+demucs-mlx song.mp3      # console script
+python -m demucs_mlx song.mp3
+```
 
 ### 3. Separate a song
 
@@ -242,7 +250,7 @@ Installed automatically by `make install`:
 | `pyyaml` | Model config parsing |
 | `tqdm` | Progress bars |
 
-Optional: `librosa` (only needed if your input audio isn't 44.1 kHz — it handles resampling).
+`librosa` is also installed — it resamples input that isn't 44.1 kHz and serves as a fallback decoder for files soundfile can't read.
 
 > **Note on PyTorch**: PyTorch is only used for STFT/iSTFT and loading pretrained weights. It runs on CPU — all the heavy computation (convolutions, transformer, U-Net) runs on Apple GPU through MLX. A future version may remove the PyTorch dependency entirely.
 
@@ -251,20 +259,22 @@ Optional: `librosa` (only needed if your input audio isn't 44.1 kHz — it handl
 ```
 demucs-mlx/
 ├── Makefile                 # make install / make uninstall
-├── separate.py              # CLI entry point
-├── demucs_mlx/
-│   ├── htdemucs.py          # Main model (hybrid U-Net + transformer)
-│   ├── hdemucs.py           # Encoder/decoder layers
-│   ├── transformer.py       # Cross-attention transformer
-│   ├── demucs.py            # DConv residual branches
-│   ├── apply.py             # Inference pipeline (chunking, shifts)
-│   ├── pretrained.py        # Model download & weight loading
-│   ├── weight_convert.py    # PyTorch → MLX weight conversion
-│   ├── spec.py              # STFT/iSTFT bridge
-│   └── utils.py             # Tensor utilities
-└── remote/                  # Model download configs
-    ├── files.txt
-    └── htdemucs.yaml
+├── pyproject.toml           # package metadata + `demucs-mlx` entry point
+└── demucs_mlx/
+    ├── cli.py               # CLI entry point (demucs-mlx / python -m demucs_mlx)
+    ├── __main__.py          # enables `python -m demucs_mlx`
+    ├── htdemucs.py          # Main model (hybrid U-Net + transformer)
+    ├── hdemucs.py           # Encoder/decoder layers
+    ├── transformer.py       # Cross-attention transformer
+    ├── demucs.py            # DConv residual branches
+    ├── apply.py             # Inference pipeline (chunking, shifts)
+    ├── pretrained.py        # Model download & weight loading
+    ├── weight_convert.py    # PyTorch → MLX weight conversion
+    ├── spec.py              # STFT/iSTFT bridge
+    ├── utils.py             # Tensor utilities
+    └── remote/              # Model download configs (shipped with the package)
+        ├── files.txt
+        └── htdemucs.yaml
 ```
 
 ## License
