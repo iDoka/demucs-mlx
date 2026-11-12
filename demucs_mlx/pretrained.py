@@ -60,107 +60,116 @@ def _parse_remote_files(remote_file_list: Path) -> tp.Dict[str, str]:
     return models
 
 
-def _download_model(url: str, cache_dir: Path) -> Path:
-    """Download a model file if not already cached."""
-    filename = url.split('/')[-1]
-    cached = cache_dir / filename
+def _sha256_prefix(remote_filename: str) -> str:
+    """Expected sha256 prefix from a torch.hub-style `<sig>-<sha256>.th` name."""
+    return remote_filename.rsplit('.', 1)[0].split('-', 1)[-1]
+
+
+def _verify_checksum(path: Path, expected: str):
+    import hashlib
+
+    sha = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            sha.update(block)
+    if not sha.hexdigest().startswith(expected):
+        raise RuntimeError(
+            f"Checksum mismatch for {path}: expected sha256 prefix "
+            f"{expected}, got {sha.hexdigest()[:len(expected)]}. "
+            f"Delete the file to download it again.")
+
+
+def _download_model(url: str, cache_dir: Path,
+                    filename: tp.Optional[str] = None) -> Path:
+    """Return a verified local copy of a checkpoint, downloading if needed.
+
+    Remote checkpoints follow the torch.hub convention `<sig>-<sha256>.th`;
+    locally they are stored under the human-readable `filename`
+    (e.g. `htdemucs_ft_vocals.th`). The file is checked against the sha256
+    prefix from the remote name every time it is loaded.
+    """
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    remote_filename = url.split('/')[-1]
+    expected = _sha256_prefix(remote_filename)
+    cached = cache_dir / (filename or remote_filename)
+
+    # Caches created by older versions use the remote name; adopt them.
+    legacy = cache_dir / remote_filename
+    if not cached.exists() and legacy.exists():
+        logger.info(f"Renaming cached model {legacy.name} -> {cached.name}")
+        legacy.replace(cached)
+
     if cached.exists():
         logger.info(f"Using cached model: {cached}")
+        _verify_checksum(cached, expected)
         return cached
 
-    logger.info(f"Downloading {url}...")
+    logger.info(f"Downloading {url} -> {cached}...")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    import urllib.request
-    urllib.request.urlretrieve(url, str(cached))
+    # Download to a temporary file so an interrupted download never leaves
+    # a truncated checkpoint that later looks like a valid cache hit.
+    partial = cached.with_name(cached.name + '.part')
+    try:
+        urllib.request.urlretrieve(url, str(partial))
+        _verify_checksum(partial, expected)
+    except BaseException as e:
+        partial.unlink(missing_ok=True)
+        if (isinstance(e, urllib.error.URLError)
+                and isinstance(e.reason, ssl.SSLCertVerificationError)):
+            raise RuntimeError(
+                f"TLS certificate verification failed for {url}: "
+                f"{e.reason.verify_message}.\n"
+                f"Download the file manually, check that its sha256 "
+                f"starts with {expected}, and place it at:\n    {cached}"
+            ) from e
+        raise
+
+    partial.replace(cached)
     logger.info(f"Saved to {cached}")
     return cached
 
 
-def _load_bag_of_models(name: str, remote_root: Path, cache_dir: Path):
-    """Load a bag-of-models configuration (YAML file mapping names to sigs)."""
+def _read_bag(name: str) -> tp.Optional[dict]:
+    """Read `remote/<name>.yaml` as {'models': [sig, ...], 'weights': ...}."""
     import yaml
 
-    bag_file = remote_root / (name + '.yaml')
+    bag_file = REMOTE_ROOT / (name + '.yaml')
     if not bag_file.exists():
         return None
-
     with open(bag_file) as f:
-        bag_config = yaml.safe_load(f)
-
-    if not isinstance(bag_config, list):
-        return None
-
-    models = _parse_remote_files(remote_root / 'files.txt')
-    loaded = []
-    for entry in bag_config:
-        if isinstance(entry, str):
-            sig = entry
-            weight = None
-        elif isinstance(entry, dict):
-            sig = entry.get('sig') or entry.get('name', entry)
-            weight = entry.get('weight')
-        else:
-            continue
-
-        if sig in models:
-            path = _download_model(models[sig], cache_dir)
-            loaded.append((path, weight))
-
-    return loaded if loaded else None
+        bag = yaml.safe_load(f)
+    if isinstance(bag, list):
+        bag = {'models': bag}
+    if not isinstance(bag, dict) or 'models' not in bag:
+        raise ValueError(f"Unexpected bag config format in {bag_file}: {bag}")
+    return bag
 
 
-def load_model(name: str = 'htdemucs',
-               cache_dir: tp.Optional[Path] = None) -> 'HTDemucs':
-    """Load a pretrained HTDemucs model.
+def _member_filename(name: str, index: int, n_models: int,
+                     weights: tp.Optional[tp.List[float]]) -> str:
+    """Human-readable file name for the index-th model of bag `name`.
 
-    Args:
-        name: Model name (e.g. 'htdemucs', 'htdemucs_ft', 'htdemucs_6s').
-        cache_dir: Directory to cache downloaded models.
-
-    Returns:
-        MLX HTDemucs model with loaded weights.
+    A single-model bag is stored as `<name>.th`. In a bag of specialists
+    (one-hot weights, like htdemucs_ft) each model is named after the stem
+    it produces: `<name>_<stem>.th`. Otherwise: `<name>_<index>.th`.
     """
+    if n_models == 1:
+        return f"{name}.th"
+    if (weights is not None and len(weights) == len(SOURCES)
+            and sorted(weights) == [0.] * (len(weights) - 1) + [1.]):
+        return f"{name}_{SOURCES[weights.index(1.)]}.th"
+    return f"{name}_{index}.th"
+
+
+def _load_checkpoint(model_path: Path) -> 'HTDemucs':
+    """Rebuild one Meta HTDemucs checkpoint as an MLX model."""
     import torch
     from .htdemucs import HTDemucs
     from .weight_convert import convert_htdemucs_weights
-
-    if cache_dir is None:
-        cache_dir = Path.home() / '.cache' / 'demucs_mlx'
-
-    # Try to find the model
-    remote_root = REMOTE_ROOT
-    models = _parse_remote_files(remote_root / 'files.txt')
-
-    # Check if it's a bag of models
-    bag_file = remote_root / (name + '.yaml')
-    if bag_file.exists():
-        # For bags, load just the first model
-        import yaml
-        with open(bag_file) as f:
-            bag_config = yaml.safe_load(f)
-
-        # Format is either: {'models': ['sig1', 'sig2']} or a list
-        if isinstance(bag_config, dict) and 'models' in bag_config:
-            sigs = bag_config['models']
-        elif isinstance(bag_config, list):
-            sigs = bag_config
-        else:
-            raise ValueError(f"Unexpected bag config format: {bag_config}")
-
-        sig = sigs[0]
-        if isinstance(sig, dict):
-            sig = list(sig.keys())[0]
-
-        if sig in models:
-            model_path = _download_model(models[sig], cache_dir)
-        else:
-            raise ValueError(f"Model signature '{sig}' not found in remote files")
-    elif name in models:
-        model_path = _download_model(models[name], cache_dir)
-    else:
-        raise ValueError(
-            f"Model '{name}' not found. Available: {list(models.keys())}")
 
     # Load PyTorch package
     logger.info(f"Loading PyTorch model from {model_path}...")
@@ -201,6 +210,74 @@ def load_model(name: str = 'htdemucs',
     logger.info(f"Model loaded: {len(model.sources)} sources, "
                 f"depth={model.depth}, channels={model.channels}")
     return model
+
+
+def load_model(name: str = 'htdemucs',
+               cache_dir: tp.Optional[Path] = None,
+               stems: tp.Optional[tp.Sequence[str]] = None
+               ) -> tp.Union['HTDemucs', 'BagOfModels']:
+    """Load a pretrained HTDemucs model.
+
+    Args:
+        name: Model name (e.g. 'htdemucs', 'htdemucs_ft', 'htdemucs_6s'),
+            or a raw checkpoint signature from remote/files.txt.
+        cache_dir: Directory to cache downloaded models
+            (default: ~/.cache/demucs_mlx).
+        stems: Stems that will actually be used. For a bag of specialist
+            models (htdemucs_ft) only the models that contribute to these
+            stems are loaded; other stems come out silent.
+
+    Returns:
+        MLX HTDemucs model with loaded weights, or a BagOfModels for
+        multi-model bags such as htdemucs_ft. Both work with apply_model.
+    """
+    from .apply import BagOfModels
+
+    if cache_dir is None:
+        cache_dir = Path.home() / '.cache' / 'demucs_mlx'
+    cache_dir = Path(cache_dir).expanduser()
+
+    models = _parse_remote_files(REMOTE_ROOT / 'files.txt')
+
+    bag = _read_bag(name)
+    if bag is None:
+        if name not in models:
+            raise ValueError(
+                f"Model '{name}' not found. Available: {list(models.keys())}")
+        return _load_checkpoint(_download_model(models[name], cache_dir))
+
+    sigs = [list(s.keys())[0] if isinstance(s, dict) else s
+            for s in bag['models']]
+    weights = bag.get('weights')
+    for sig in sigs:
+        if sig not in models:
+            raise ValueError(
+                f"Model signature '{sig}' not found in remote files")
+
+    if len(sigs) == 1:
+        return _load_checkpoint(_download_model(
+            models[sigs[0]], cache_dir, _member_filename(name, 0, 1, None)))
+
+    if weights is None:
+        weights = [[1.] * len(SOURCES) for _ in sigs]
+    selected = list(range(len(sigs)))
+    if stems is not None:
+        unknown = [s for s in stems if s not in SOURCES]
+        if unknown:
+            raise ValueError(
+                f"unknown stem(s) {unknown} for model {name!r}; "
+                f"available: {SOURCES}")
+        wanted = [SOURCES.index(s) for s in stems]
+        selected = [i for i in selected
+                    if any(weights[i][k] for k in wanted)]
+
+    sub_models = []
+    for i in selected:
+        path = _download_model(
+            models[sigs[i]], cache_dir,
+            _member_filename(name, i, len(sigs), weights[i]))
+        sub_models.append(_load_checkpoint(path))
+    return BagOfModels(sub_models, [weights[i] for i in selected])
 
 
 def _load_weights(model, flat_state: dict):

@@ -27,3 +27,4 @@ input/
 
 .cache/
 *.th
+models/

@@ -17,7 +17,39 @@ from .htdemucs import HTDemucs
 from .utils import center_trim
 
 
-def apply_model(model: HTDemucs,
+class BagOfModels:
+    """Several HTDemucs models whose outputs are mixed per source.
+
+    ``weights[i][k]`` is how much model ``i`` contributes to source ``k``.
+    htdemucs_ft is a bag of four specialists with one-hot weights, so each
+    stem comes from the model fine-tuned for it. A bag may hold only a
+    subset of its models (see ``load_model(stems=...)``); sources that no
+    loaded model contributes to come out silent.
+    """
+
+    def __init__(self, models: tp.List[HTDemucs],
+                 weights: tp.Optional[tp.List[tp.List[float]]] = None):
+        assert models, "BagOfModels needs at least one model"
+        first = models[0]
+        for other in models[1:]:
+            assert other.sources == first.sources
+            assert other.samplerate == first.samplerate
+            assert other.audio_channels == first.audio_channels
+        if weights is None:
+            weights = [[1.] * len(first.sources) for _ in models]
+        assert len(weights) == len(models)
+        for w in weights:
+            assert len(w) == len(first.sources)
+
+        self.models = models
+        self.weights = weights
+        self.sources = first.sources
+        self.samplerate = first.samplerate
+        self.audio_channels = first.audio_channels
+        self.segment = min(float(m.segment) for m in models)
+
+
+def apply_model(model: tp.Union[HTDemucs, BagOfModels],
                 mix: mx.array,
                 shifts: int = 1,
                 split: bool = True,
@@ -40,6 +72,26 @@ def apply_model(model: HTDemucs,
     Returns:
         Separated sources ``[B, S, C, T]``.
     """
+    if isinstance(model, BagOfModels):
+        out = None
+        totals = mx.zeros((len(model.sources),))
+        for idx, (sub_model, weight) in enumerate(
+                zip(model.models, model.weights)):
+            if progress and len(model.models) > 1:
+                print(f"Model {idx + 1}/{len(model.models)}")
+            res = apply_model(
+                sub_model, mix, shifts=shifts, split=split, overlap=overlap,
+                transition_power=transition_power, progress=progress,
+                segment=segment)
+            w = mx.array(weight, dtype=res.dtype)
+            res = res * w[None, :, None, None]
+            out = res if out is None else out + res
+            totals = totals + w
+            mx.eval(out)
+        # Sources no loaded model contributes to stay silent (0 / 1).
+        totals = mx.where(totals > 0, totals, mx.ones_like(totals))
+        return out / totals[None, :, None, None]
+
     mx.eval(model.parameters())
 
     batch, channels, length = mix.shape

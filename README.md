@@ -64,7 +64,7 @@ python -m demucs_mlx song.mp3
 demucs-mlx song.mp3
 ```
 
-The first run downloads the pretrained model (~80 MB, cached in `~/.cache/demucs_mlx/`). Output goes to `separated/htdemucs/<song>/` with 4 WAV files: `drums.wav`, `bass.wav`, `other.wav`, `vocals.wav`.
+The first run downloads the pretrained model (~80 MB, cached in `~/.cache/demucs_mlx/`, or in the directory given by `--model-dir`). Output goes to `separated/htdemucs/<song>/` with 4 WAV files: `drums.wav`, `bass.wav`, `other.wav`, `vocals.wav`.
 
 > If you see a PATH warning during install, add this to your `~/.zshrc`:
 > ```bash
@@ -73,33 +73,104 @@ The first run downloads the pretrained model (~80 MB, cached in `~/.cache/demucs
 
 ### Usage
 
+Full reference (`demucs-mlx --help`):
+
 ```
 $ demucs-mlx --help
 
-usage: demucs-mlx [-h] [-n NAME] [-o DIR] [--stems STEM [STEM ...]]
-                  [--mp3] [--m4a] [--float32] [--shifts N] [--overlap F]
-                  [--no-split] input
+usage: demucs-mlx [-h] [-n NAME] [--model-dir DIR] [-o DIR]
+                  [--stems STEM [STEM ...]] [--mp3 | --m4a] [--float32]
+                  [--shifts N] [--overlap F] [--no-split]
+                  input
 
-Separate a song into stems (drums, bass, other, vocals)
-using HTDemucs on Apple Silicon with MLX.
+Separate a song into stems (drums, bass, other, vocals; plus guitar and
+piano with htdemucs_6s) using Meta's HTDemucs on Apple Silicon with MLX.
+
+Input is decoded with soundfile, then macOS afconvert, then librosa as a
+fallback, so WAV, FLAC, OGG, MP3, M4A/AAC and misnamed containers all work.
+Mono input is duplicated to stereo; input that is not 44.1 kHz is resampled
+with librosa before separation (stems are written at 44.1 kHz).
 
 positional arguments:
-  input                 input audio file (WAV, MP3, FLAC, OGG, etc.)
+  input                 input audio file: WAV, FLAC, OGG, MP3, M4A/AAC or
+                        anything soundfile, afconvert or librosa can decode
+
+options:
+  -h, --help            show this help message and exit
 
 model:
-  -n, --name NAME       model name (default: htdemucs)
+  -n, --name NAME       pretrained model: htdemucs, htdemucs_ft, htdemucs_6s
+                        or a raw checkpoint signature; see 'models' below
+                        (default: htdemucs)
+  --model-dir DIR       directory where model checkpoints are looked up and
+                        downloaded to; created if missing, '~' is expanded;
+                        see 'model files' below (default: ~/.cache/demucs_mlx)
 
 output:
-  -o, --output DIR      output directory (default: ./separated/<model>/<song>/)
-  --stems STEM [STEM]   stems to save: drums bass other vocals (default: all)
-  --mp3                 save as MP3 instead of WAV
-  --m4a                 save stems as M4A/AAC instead of WAV
-  --float32             save as float32 WAV instead of int16 WAV
+  -o, --output DIR      base output directory; stems are written to
+                        DIR/<song>/ (default: ./separated/<model>, i.e.
+                        ./separated/<model>/<song>/)
+  --stems STEM [STEM ...]
+                        save only these stems, space separated: drums bass
+                        other vocals (+ guitar piano for htdemucs_6s). With
+                        htdemucs_ft this also skips the unneeded models
+                        (default: all stems of the model)
+  --mp3                 save stems as MP3 (LAME VBR -q:a 2, ~190 kbps);
+                        requires ffmpeg in PATH
+  --m4a                 save stems as M4A/AAC using Apple's AudioToolbox
+                        encoder (ffmpeg -c:a aac_at); requires ffmpeg built
+                        with AudioToolbox, e.g. Homebrew's
+  --float32             write 32-bit float WAV instead of 16-bit PCM (no
+                        clipping, 2x file size); WAV output only
 
-quality:
-  --shifts N            random shifts, higher = better but slower (default: 1)
-  --overlap F           chunk overlap, 0.0 to 1.0 (default: 0.25)
-  --no-split            don't chunk, process whole track at once (more memory)
+quality / performance:
+  --shifts N            run the model N times on the input shifted by a random
+                        0-0.5 s offset and average the results: slightly
+                        better quality, N times slower; 0 disables shifting
+                        (default: 1)
+  --overlap F           overlap between consecutive ~7.8 s segments as a
+                        fraction in [0, 1); higher values give smoother
+                        segment boundaries but take longer, e.g. 0.5 is ~1.5x
+                        slower than 0.25 (default: 0.25)
+  --no-split            process the input in one pass instead of overlapping
+                        segments; HTDemucs only accepts up to one training
+                        segment (~7.8 s, ~7.3 s with --shifts >= 1), so this
+                        is only useful for short clips
+
+models (-n NAME):
+  htdemucs      default; 4 stems, 1 checkpoint (~80 MB), fastest
+  htdemucs_ft   4 stems; bag of 4 fine-tuned specialists (~4 x 80 MB),
+                one per stem: best quality, ~4x slower. With --stems only
+                the specialists for the requested stems are loaded, e.g.
+                --stems vocals runs a single model.
+  htdemucs_6s   6 stems: drums bass other vocals guitar piano (~55 MB);
+                piano is noticeably weaker than the other stems
+  <signature>   a raw checkpoint id from demucs_mlx/remote/files.txt
+                (HTDemucs checkpoints only, e.g. 955717e8)
+
+model files (--model-dir):
+  Checkpoints are downloaded from dl.fbaipublicfiles.com on first use and
+  stored under human-readable names, verified by sha256 on every load:
+    htdemucs.th  htdemucs_6s.th
+    htdemucs_ft_drums.th  htdemucs_ft_bass.th
+    htdemucs_ft_other.th  htdemucs_ft_vocals.th
+  Files put there by hand are used as-is (after the sha256 check), so a
+  directory can be pre-populated for offline use. Cache entries left by
+  older versions (<signature>-<sha256>.th) are renamed on first use.
+
+output layout:
+  <DIR>/<song>/<stem>.<wav|mp3|m4a>, where <DIR> is -o DIR or
+  ./separated/<model>; <song> is the input file name without extension.
+  Existing files are overwritten.
+
+examples:
+  demucs-mlx song.mp3
+  demucs-mlx song.mp3 --stems vocals
+  demucs-mlx song.mp3 --stems vocals drums -o my_stems/
+  demucs-mlx song.mp3 -n htdemucs_ft --stems vocals --model-dir ./models
+  demucs-mlx song.mp3 -n htdemucs_6s --stems guitar piano --m4a
+  demucs-mlx song.mp3 --shifts 3 --overlap 0.5 --float32
+  python -m demucs_mlx song.mp3          (same as demucs-mlx)
 ```
 
 ### Examples
@@ -117,8 +188,14 @@ demucs-mlx song.mp3 -o my_stems/
 # Better quality (3 shifts), slower
 demucs-mlx song.mp3 --shifts 3
 
-# Use the fine-tuned model
+# Use the fine-tuned model (4 specialist models)
 demucs-mlx song.mp3 -n htdemucs_ft
+
+# Fine-tuned vocals only: loads and runs just the vocals specialist
+demucs-mlx song.mp3 -n htdemucs_ft --stems vocals
+
+# Keep model files in a project directory instead of ~/.cache/demucs_mlx
+demucs-mlx song.mp3 --model-dir ./models
 
 # Save as float32 WAV
 demucs-mlx song.mp3 --float32
@@ -135,8 +212,9 @@ import soundfile as sf
 from demucs_mlx.pretrained import load_model
 from demucs_mlx.apply import apply_model
 
-# Load model (downloads on first use)
-model = load_model("htdemucs")
+# Load model (downloads on first use). For htdemucs_ft this returns a
+# BagOfModels of 4 specialists; pass stems=[...] to load only some of them.
+model = load_model("htdemucs", cache_dir="./models")
 
 # Load audio
 wav, sr = sf.read("song.mp3", dtype="float32")
@@ -203,21 +281,21 @@ Both branches meet at a **Cross-Transformer** bottleneck that lets them exchange
 
 ## Choosing a model
 
-Models download automatically on first use (~80 MB each, cached in `~/.cache/demucs_mlx/`). Use the `-n` flag to switch models.
+Models download automatically on first use (~80 MB per checkpoint) into `~/.cache/demucs_mlx/`, or into `--model-dir DIR`. Files get human-readable names (`htdemucs.th`, `htdemucs_6s.th`, `htdemucs_ft_drums.th` … `htdemucs_ft_vocals.th`) and are verified by sha256 on every load, so a directory can also be filled by hand for offline use. Use the `-n` flag to switch models.
 
 ### Available models
 
 | Model | Sources | Description | Status |
 |-------|---------|-------------|--------|
 | `htdemucs` | 4 (drums, bass, other, vocals) | Default HTDemucs — fast and reliable | Supported |
-| `htdemucs_ft` | 4 (drums, bass, other, vocals) | Fine-tuned on more data — better vocal separation | Supported |
-| `htdemucs_6s` | 6 (drums, bass, other, vocals, guitar, piano) | 6-source variant — separates guitar and piano too | Untested |
+| `htdemucs_ft` | 4 (drums, bass, other, vocals) | Bag of 4 fine-tuned models, one specialist per stem — best quality, ~4x slower | Supported |
+| `htdemucs_6s` | 6 (drums, bass, other, vocals, guitar, piano) | 6-source variant — separates guitar and piano too | Supported |
 
 ### Which model should I use?
 
 - **General use?** Start with `htdemucs` (the default). It's the standard model and works well on most music.
-- **Best vocal isolation?** Use `htdemucs_ft` — it's fine-tuned on a larger dataset and produces cleaner vocal separation, especially on complex mixes.
-- **Need guitar or piano stems?** Try `htdemucs_6s` — it outputs 6 separate stems instead of 4. Note: this variant is untested in the MLX port, so results may vary.
+- **Best quality?** Use `htdemucs_ft` — four models, each fine-tuned for one stem; every stem is taken from its specialist. It runs all four models (~4x slower), unless you pass `--stems`: `-n htdemucs_ft --stems vocals` runs only the vocals specialist, as fast as the default model.
+- **Need guitar or piano stems?** Try `htdemucs_6s` — it outputs 6 separate stems instead of 4. The piano stem is noticeably weaker than the others (as in the original Demucs).
 
 ```bash
 # Default model (4 stems)
