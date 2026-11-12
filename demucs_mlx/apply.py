@@ -88,20 +88,8 @@ def apply_model(model: HTDemucs,
                 pass
 
         for offset in offsets:
-            chunk_length = min(segment_length, length - offset)
-            # Extract chunk with padding to segment_length
-            chunk = mix[..., offset:offset + chunk_length]
-            if chunk.shape[-1] < segment_length:
-                pad_r = segment_length - chunk.shape[-1]
-                chunk = mx.pad(chunk, [(0, 0), (0, 0), (0, pad_r)])
-
-            chunk_out = apply_model(
-                model, chunk, shifts=0, split=False,
-                overlap=overlap, transition_power=transition_power,
-                progress=False, segment=segment)
-
             actual_len = min(segment_length, length - offset)
-            chunk_out = chunk_out[..., :actual_len]
+            chunk_out = _apply_padded(model, mix, offset, actual_len, segment)
             w = weight[:actual_len]
 
             # Accumulate
@@ -115,21 +103,36 @@ def apply_model(model: HTDemucs,
 
     else:
         # Direct application (no splitting)
-        if segment is not None:
-            valid_length = int(segment * model.samplerate)
-        elif hasattr(model, 'valid_length'):
-            valid_length = model.valid_length(length)
-        else:
-            valid_length = length
+        return _apply_padded(model, mix, 0, length, segment)
 
-        if length < valid_length:
-            padded = mx.pad(mix, [(0, 0), (0, 0), (0, valid_length - length)])
-        else:
-            padded = mix
 
-        out = model(padded)
-        mx.eval(out)
-        return center_trim(out, length)
+def _apply_padded(model: HTDemucs, mix: mx.array, offset: int, length: int,
+                  segment: tp.Optional[float]) -> mx.array:
+    """Run the model on ``mix[..., offset:offset + length]``.
+
+    Like demucs' ``TensorChunk.padded``, the window is grown symmetrically
+    to the model's valid length, using the surrounding audio as context
+    and zeros only beyond the ends of ``mix``; the output is center-trimmed
+    back to ``length`` samples.
+    """
+    if segment is not None:
+        valid_length = int(segment * model.samplerate)
+    elif hasattr(model, 'valid_length'):
+        valid_length = model.valid_length(length)
+    else:
+        valid_length = length
+
+    total = mix.shape[-1]
+    start = offset - (valid_length - length) // 2
+    end = start + valid_length
+    chunk = mix[..., max(0, start):min(total, end)]
+    pad_left, pad_right = max(0, -start), max(0, end - total)
+    if pad_left or pad_right:
+        chunk = mx.pad(chunk, [(0, 0), (0, 0), (pad_left, pad_right)])
+
+    out = model(chunk)
+    mx.eval(out)
+    return center_trim(out, length)
 
 
 def _add_weighted(out: mx.array, chunk: mx.array, weight: mx.array,
